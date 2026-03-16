@@ -127,14 +127,14 @@ int main(void)
                    mv0  < 0 ? "-" : "", v0_whole < 0 ? -v0_whole : v0_whole, v0_frac,
                    i_pA0 < 0 ? "-" : "", i_whole0 < 0 ? -i_whole0 : i_whole0, i_frac0);
 
-            printk("A2: -%s%d.%03d V  |  %s%d.%03d nA\n",
-                   mv2  < 0 ? "-" : "", v2_whole < 0 ? -v2_whole : v2_whole, v2_frac,
-                   i_pA2 < 0 ? "-" : "", i_whole2 < 0 ? -i_whole2 : i_whole2, i_frac2);
+            printk("A2: %s%d.%03d V  |  %s%d.%03d nA\n",
+                   mv2  > 0 ? "-" : "", v2_whole < 0 ? -v2_whole : v2_whole, v2_frac,
+                   i_pA2 > 0 ? "-" : "", i_whole2 < 0 ? -i_whole2 : i_whole2, i_frac2);
 
             printk("---\n");
         }
 
-        k_sleep(K_MSEC(100));
+        k_sleep(K_MSEC(20));
     }
 
     return 0;
