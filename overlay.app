@@ -1,0 +1,4 @@
+&adc {
+    status = "okay";
+};
+
