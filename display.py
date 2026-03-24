@@ -123,7 +123,7 @@ def update(frame):
         ax.legend(loc='upper left', fontsize=10)
         ax.grid(True, alpha=0.15)
         fig.tight_layout()
-
+ 
     except Exception as e:
         print(f"Error: {e}")
 
