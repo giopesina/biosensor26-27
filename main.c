@@ -2,6 +2,8 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/pwm.h>
+#include <zephyr/drivers/i2c.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/devicetree.h>
 
@@ -16,8 +18,82 @@ static const struct device *adc_dev = DEVICE_DT_GET(ADC_NODE);
 static const struct device *pwm_dev;
 #define PWM_CHANNEL    0
 #define PWM_FLAGS      0
-#define PWM_PERIOD_NS  100000UL              /* 10 kHz */
-#define SWEEP_STEP_NS  (PWM_PERIOD_NS / 100) /* 1% per step */
+#define PWM_PERIOD_NS  100000UL
+#define SWEEP_STEP_NS  (PWM_PERIOD_NS / 100)
+
+/* ── LMP91000 ────────────────────────────────────────────────── */
+#define I2C_NODE             DT_NODELABEL(i2c22)
+#define LMP91000_ADDR        0x48
+
+#define LMP91000_REG_STATUS  0x00
+#define LMP91000_REG_LOCK    0x01
+#define LMP91000_REG_TIACN   0x10
+#define LMP91000_REG_REFCN   0x11
+#define LMP91000_REG_MODECN  0x12
+
+/*
+ * TIACN: TIA gain = 35k (bits[4:2]=010), Rload = 10 ohm (bits[1:0]=00)
+ * change gain to match your sensor current range:
+ * 2k=001  3.5k=010  7k=011  14k=100  35k=101  120k=110  350k=111
+ */
+#define LMP91000_TIACN_VAL   0x08
+
+/*
+ * REFCN: internal reference, 50% zero, 0% bias
+ * bit7=0 (internal ref), bits[5:4]=10 (50% zero), bits[3:0]=0000 (0% bias)
+ */
+#define LMP91000_REFCN_VAL   0x20
+
+/*
+ * MODECN: 3-lead amperometric cell mode
+ * bits[2:0] = 011
+ */
+#define LMP91000_MODECN_VAL  0x03
+
+/* MENB pin — D6 = gpio2 pin 8, pull low to enable I2C */
+#define MENB_GPIO_NODE  DT_NODELABEL(gpio2)
+#define MENB_GPIO_PIN   8
+
+static const struct device *i2c_dev;
+
+/* ── LMP91000 helpers ────────────────────────────────────────── */
+static int lmp91000_write(uint8_t reg, uint8_t val)
+{
+    uint8_t buf[2] = { reg, val };
+    return i2c_write(i2c_dev, buf, sizeof(buf), LMP91000_ADDR);
+}
+
+static int lmp91000_read(uint8_t reg, uint8_t *val)
+{
+    return i2c_write_read(i2c_dev, LMP91000_ADDR, &reg, 1, val, 1);
+}
+
+static int lmp91000_init(void)
+{
+    int err;
+    uint8_t status;
+
+    err = lmp91000_read(LMP91000_REG_STATUS, &status);
+    if (err < 0) {
+        printk("LMP91000 read failed: %d\n", err);
+        return err;
+    }
+    if (!(status & 0x01)) {
+        printk("LMP91000 not ready (status=0x%02x)\n", status);
+        return -ENODEV;
+    }
+    printk("LMP91000 status OK (0x%02x)\n", status);
+
+    lmp91000_write(LMP91000_REG_LOCK,   0x00);  /* unlock */
+    lmp91000_write(LMP91000_REG_TIACN,  LMP91000_TIACN_VAL);
+    lmp91000_write(LMP91000_REG_REFCN,  LMP91000_REFCN_VAL);
+    lmp91000_write(LMP91000_REG_MODECN, LMP91000_MODECN_VAL);
+    lmp91000_write(LMP91000_REG_LOCK,   0x01);  /* lock */
+
+    printk("LMP91000 configured (TIACN=0x%02x REFCN=0x%02x MODECN=0x%02x)\n",
+           LMP91000_TIACN_VAL, LMP91000_REFCN_VAL, LMP91000_MODECN_VAL);
+    return 0;
+}
 
 /* ── PWM sweep state ─────────────────────────────────────────── */
 static uint32_t sweep_duty_ns = 0;
@@ -69,23 +145,39 @@ int main(void)
         .resolution  = 12,
     };
 
-    /* ADC init */
+    /* ── ADC init ── */
     if (!device_is_ready(adc_dev)) { printk("ADC not ready\n"); return 0; }
     err = adc_channel_setup(adc_dev, &ch0_cfg);
     if (err < 0) { printk("CH0 failed: %d\n", err); return 0; }
     err = adc_channel_setup(adc_dev, &ch2_cfg);
     if (err < 0) { printk("CH2 failed: %d\n", err); return 0; }
 
-    /* PWM init */
+    /* ── PWM init ── */
     pwm_dev = DEVICE_DT_GET(DT_NODELABEL(pwm20));
     if (!device_is_ready(pwm_dev)) { printk("PWM not ready\n"); return 0; }
     pwm_set(pwm_dev, PWM_CHANNEL, PWM_PERIOD_NS, 0, PWM_FLAGS);
-    printk("PWM analog out on D1, ADC on A0 and A2\n");
+    printk("PWM analog out on D1\n");
+
+    /* ── MENB low to enable LMP91000 I2C ── */
+    const struct device *menb_gpio = DEVICE_DT_GET(MENB_GPIO_NODE);
+    if (!device_is_ready(menb_gpio)) { printk("MENB GPIO not ready\n"); return 0; }
+    gpio_pin_configure(menb_gpio, MENB_GPIO_PIN, GPIO_OUTPUT_LOW);
+    k_msleep(5);  /* wait for LMP91000 to wake */
+
+    /* ── I2C + LMP91000 init ── */
+    i2c_dev = DEVICE_DT_GET(I2C_NODE);
+    if (!device_is_ready(i2c_dev)) { printk("I2C not ready\n"); return 0; }
+    err = lmp91000_init();
+    if (err < 0) {
+        printk("LMP91000 init failed: %d — continuing without it\n", err);
+    }
+
+    printk("ADC start on A0 and A2\n");
 
     while (1) {
         sweep_step();
 
-        /* sweep voltage with -1.7V offset so 0% duty = -1.700V */
+        /* sweep voltage with -1.7V offset */
         int32_t sweep_mv = (int32_t)((3300UL * sweep_duty_ns) / PWM_PERIOD_NS);
         sweep_mv -= 1700;
         int sw_whole = sweep_mv / 1000;
@@ -99,8 +191,8 @@ int main(void)
         if (err < 0) {
             printk("adc_read failed: %d\n", err);
         } else {
-            /* A0: voltage + current */
-            int32_t mv0 = (int32_t)samples[0] * 2;
+            /* A0: voltage + current — fixed: removed * 2 */
+            int32_t mv0 = (int32_t)samples[0];
             adc_raw_to_millivolts(adc_ref_internal(adc_dev), ADC_GAIN_1_4, 12, &mv0);
             int v0_whole = mv0 / 1000, v0_frac = mv0 % 1000;
             if (v0_frac < 0) v0_frac = -v0_frac;
@@ -108,7 +200,7 @@ int main(void)
             int     i_whole0 = i_pA0 / 1000, i_frac0 = i_pA0 % 1000;
             if (i_frac0 < 0) i_frac0 = -i_frac0;
 
-            /* A2: voltage + current (samples[1] = second channel in buffer) */
+            /* A2: voltage + current */
             int32_t mv2 = (int32_t)samples[1];
             adc_raw_to_millivolts(adc_ref_internal(adc_dev), ADC_GAIN_1_4, 12, &mv2);
             int v2_whole = mv2 / 1000, v2_frac = mv2 % 1000;
@@ -128,13 +220,13 @@ int main(void)
                    i_pA0 < 0 ? "-" : "", i_whole0 < 0 ? -i_whole0 : i_whole0, i_frac0);
 
             printk("A2: %s%d.%03d V  |  %s%d.%03d nA\n",
-                   mv2  > 0 ? "-" : "", v2_whole < 0 ? -v2_whole : v2_whole, v2_frac,
-                   i_pA2 > 0 ? "-" : "", i_whole2 < 0 ? -i_whole2 : i_whole2, i_frac2);
+                   mv2  < 0 ? "-" : "", v2_whole < 0 ? -v2_whole : v2_whole, v2_frac,
+                   i_pA2 < 0 ? "-" : "", i_whole2 < 0 ? -i_whole2 : i_whole2, i_frac2);
 
             printk("---\n");
         }
 
-        k_sleep(K_MSEC(20));
+        k_sleep(K_MSEC(100));
     }
 
     return 0;
