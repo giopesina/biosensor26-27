@@ -125,7 +125,7 @@ void configureHSLoop()
   WGCfg_Type wg;
   AD5940_StructInit(&wg, sizeof(wg));
   wg.WgType     = WGTYPE_MMR;   // Direct MMR write (manual DC)
-  wg.WgCode = 0x800;   // mid-scale start   
+  wg.WgCode = 0x800;   // mid-scale start
   AD5940_WGCfgS(&wg);
 
   // ── ADC ─────────────────────────────────────
@@ -184,10 +184,60 @@ void setDACPotential_mV(float cell_mv)
 }
 
 // ─────────────────────────────────────────────
+//  SIMULATION MODE
+//  Set to 1 to output synthetic DPV data instead
+//  of reading from the hardware ADC.
+//  Set to 0 to use real hardware.
+// ─────────────────────────────────────────────
+#define SIMULATE 1
+
+// ── Simulation parameters ────────────────────
+// Mimics a single faradaic peak on a sloped
+// capacitive background, typical of a real DPV
+// voltammogram.
+#define SIM_PEAK_MV       100.0f   // Peak centre potential (mV)
+#define SIM_PEAK_WIDTH_MV   60.0f   // Gaussian sigma (mV) — sharper = smaller
+#define SIM_PEAK_AMP_UA      8.5f   // Peak height (µA)
+#define SIM_BG_SLOPE      0.002f    // Capacitive background slope (µA/mV)
+#define SIM_NOISE_UA        0.05f   // ±noise amplitude (µA)
+
+// Simple pseudo-random noise (no stdlib rand needed)
+static uint32_t _lfsr = 0xACE1u;
+static float simNoise()
+{
+  _lfsr ^= _lfsr << 13;
+  _lfsr ^= _lfsr >> 17;
+  _lfsr ^= _lfsr << 5;
+  // Map to -1..+1 then scale
+  float n = ((float)(_lfsr & 0xFFFF) / 32767.5f) - 1.0f;
+  return n * SIM_NOISE_UA;
+}
+
+// Returns simulated ΔI (µA) at a given staircase potential
+static float simulateDeltaI(float e_step_mv)
+{
+  // Gaussian faradaic peak
+  float diff   = e_step_mv - SIM_PEAK_MV;
+  float gauss  = SIM_PEAK_AMP_UA * expf(-(diff * diff) /
+                   (2.0f * SIM_PEAK_WIDTH_MV * SIM_PEAK_WIDTH_MV));
+
+  // Linear capacitive background
+  float bg = SIM_BG_SLOPE * (e_step_mv - DPV_START_MV);
+
+  return gauss + bg + simNoise();
+}
+
+// ─────────────────────────────────────────────
 //  Single averaged ADC read → current in µA
+//  Returns real hardware value when SIMULATE=0
 // ─────────────────────────────────────────────
 float readCurrentUA()
 {
+#if SIMULATE
+  // Hardware calls skipped in simulation mode;
+  // timing still observed via delay() in runDPV().
+  return 0.0f;   // unused in sim path — see runDPV()
+#else
   // Flush one reading to clear pipeline
   AD5940_ReadAfeResult(AFERESULT_SINC2);
   delay(10);
@@ -195,9 +245,10 @@ float readCurrentUA()
   uint32_t sinc2 = AD5940_ReadAfeResult(AFERESULT_SINC2);
   uint16_t code  = sinc2 & 0xFFFF;
 
-  float vtia     = AD5940_ADCCode2Volt(code, ADCPGA_1, 1.82f);
-  float current  = (vtia / RTIA_OHMS) * 1e6f;   // µA
+  float vtia    = AD5940_ADCCode2Volt(code, ADCPGA_1, 1.82f);
+  float current = (vtia / RTIA_OHMS) * 1e6f;   // µA
   return current;
+#endif
 }
 
 // ─────────────────────────────────────────────
@@ -206,7 +257,11 @@ float readCurrentUA()
 // ─────────────────────────────────────────────
 void runDPV()
 {
+#if SIMULATE
+  Serial.println("\n── DPV Scan Start (SIMULATED) ──");
+#else
   Serial.println("\n── DPV Scan Start ──");
+#endif
   Serial.println("Potential(mV), DeltaI(uA)");
 
   int numSteps = (int)((DPV_END_MV - DPV_START_MV) / DPV_STEP_MV) + 1;
@@ -215,9 +270,15 @@ void runDPV()
   {
     float e_step = DPV_START_MV + s * DPV_STEP_MV;   // staircase potential
 
+#if SIMULATE
+    // Observe realistic timing without real hardware reads
+    delay(DPV_STEP_PERIOD_MS);
+    float delta_i = simulateDeltaI(e_step);
+
+#else
     // ── Phase 1: baseline (pre-pulse) ───────────
     setDACPotential_mV(e_step);
-    delay(DPV_STEP_PERIOD_MS - DPV_PULSE_WIDTH_MS);   // wait before pulse
+    delay(DPV_STEP_PERIOD_MS - DPV_PULSE_WIDTH_MS);
 
     float i_baseline = readCurrentUA();
 
@@ -230,8 +291,8 @@ void runDPV()
     // ── Phase 3: pulse OFF (return to staircase) ─
     setDACPotential_mV(e_step);
 
-    // ── Differential current ─────────────────────
     float delta_i = i_pulse - i_baseline;
+#endif
 
     // Output CSV line: potential at staircase base, delta current
     Serial.print(e_step, 1);
@@ -275,6 +336,7 @@ void setup()
 
   SPI.begin();
 
+#if !SIMULATE
   hardResetAD5941();
   AD5940_Initialize();
   AD5940_WakeUp(10);
@@ -283,10 +345,12 @@ void setup()
   configureHSLoop();
   printDebugRegs();
 
-  // Allow cell to equilibrate at start potential before scanning
   Serial.println("\nEquilibrating at start potential (2 s)...");
   setDACPotential_mV(DPV_START_MV);
   delay(2000);
+#else
+  Serial.println("SIMULATE=1: skipping hardware init.");
+#endif
 
   runDPV();
 }
